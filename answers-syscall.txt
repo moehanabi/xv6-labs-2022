@@ -1,0 +1,6 @@
+usertrap()
+0x7, SYS_exec
+U
+lw a3,0(zero); a3
+Load page fault; no; yes
+initcode; 1
