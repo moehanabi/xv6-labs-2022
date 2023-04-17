@@ -88,7 +88,9 @@ struct proc {
   // for sigalarm
   int alarm_interval;
   int alarm_remaining;
+  int alarm_in;
   uint64 alarm_handler;
+  struct trapframe alarm_context;
 
   // p->lock must be held when using these:
   enum procstate state;        // Process state
