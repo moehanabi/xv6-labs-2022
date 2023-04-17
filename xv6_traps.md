@@ -320,6 +320,59 @@ if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
 > - You've succeeded if alarmtest prints "alarm!".
 >
 
+参考 syscall 实验，先添加上系统调用的框架。其中两个用户态函数的签名分别为 `int sigalarm(int ticks, void (*handler)());` 和 `int sigreturn(void);`.
+
+根据提示，添加 `$U/_alarmtest` 到 `Makefile` 以启用 `alarmtest.c` 的编译。
+
+根据提示，在 PCB 中添加与 `sigalarm` 相关的数据：
+
+- `int alarm_interval` 保存 alarm 的间隔
+- `int alarm_remaining` 保存距下次 alarm 剩余 ticks 数
+- `uint64 alarm_handler` 保存 alarm 发生时应调用的函数的地址
+
+随后还需要在 `kernel/proc.c` 的 `allocproc()` 中添加相关域的初始化过程：
+
+```c
+// for sigalarm fields
+p->alarm_handler = 0;
+p->alarm_interval = 0;
+p->alarm_remaining = 0;
+```
+
+随后在 `kernel/trap.c` 的 `usertrap()` 中添加每次时钟中断发生时对 alarm 的相应处理：标记相应的 ticks，判断是否已经到时间，若已经到了则将 handler 插入进程执行流中，并重置剩余 ticks。
+
+搜寻了一下，发现 `usertrap()` 中与时钟有关的只有 `devintr()` 中的 `clockintr()` 函数。当发生时钟中断时，`devintr()` 会返回 2 给 `which_dev`，因此可以把相关代码插入到下方 `if(which_dev == 2)` 的语句块中。
+
+RISC-V 从中断返回的时候是返回到 `epc` 寄存器所指的地址处的，因此对中断帧中的 `epc` 原来的值做修改，即可在进程中断返回时跳转到 handler 函数中：
+
+```c
+if (which_dev == 2) {
+  if (p->alarm_interval && --p->alarm_remaining <= 0) {
+    p->trapframe->epc = (uint64)p->alarm_handler;
+    p->alarm_remaining = p->alarm_interval;
+  }
+  yield();
+}
+```
+
+最后编写 `sys_sigalarm` 和 `sys_sigreturn` 的实现，其中 `sys_sigreturn` 暂时以 `return 0;` 填充：
+
+```c
+uint64 sys_sigalarm(void) {
+  struct proc *p = myproc();
+  argint(0, &p->alarm_interval);
+  p->alarm_remaining = p->alarm_interval;
+  argaddr(1, &p->alarm_handler);
+  return 0;
+}
+
+uint64 sys_sigreturn(void){
+  return 0;
+}
+```
+
+跑一下测试，test0 通过。
+
 ## test1/test2()/test3(): resume interrupted code
 
 > Chances are that alarmtest crashes in test0 or test1 after it prints "alarm!", or that alarmtest (eventually) prints "test1 failed", or that alarmtest exits without printing "test1 passed". To fix this, you must ensure that, when the alarm handler is done, control returns to the instruction at which the user program was originally interrupted by the timer interrupt. You must ensure that the register contents are restored to the values they held at the time of the interrupt, so that the user program can continue undisturbed after the alarm. Finally, you should "re-arm" the alarm counter after each time it goes off, so that the handler is called periodically.
@@ -334,3 +387,44 @@ if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
 > - Make sure to restore a0. `sigreturn` is a system call, and its return value is stored in a0.
 >
 > Once you pass `test0`, `test1`, `test2`, and `test3` run `usertests -q` to make sure you didn't break any other parts of the kernel.
+
+上面的代码有一个问题，就是跑完 alarm handler 之后就没法回到原有的函数了，至少它把中断帧中的 `epc` 覆盖了且没有事先保存起来。
+
+根据提示，要在调用 alarm handler 之前把当前的上下文保存起来以便稍后恢复。而 alarm handler 在结束的时候会调用 `sigreturn` 系统调用，因此可以使用 `sigreturn` 系统调用来恢复之前保存的上下文。
+
+不妨直接在 PCB 里加一个 `struct trapframe alarm_context` 域，通过 `trap.c` 中添加 `memmove(&p->alarm_context, p->trapframe, sizeof(struct trapframe))` 直接复制原中断帧的所有内容把所有的寄存器都保存起来，注意要在修改原栈帧之前保存。在 `sys_sigreturn()` 中添加 `memmove(p->trapframe, &p->alarm_context, sizeof(struct trapframe))` 将原中断帧的所有内容都恢复回去。
+
+另外要避免 handler 重进入，可以考虑在 PCB 里再加一个 `int alarm_in` 作为 flag，指示当前进程是否是在 alarm handler 中，若是，则不进入 alarm 处理分支（代码略）。
+
+记得以上新加的域都需要在 `allocproc()` 中添加相关初始化过程。。真的吗？事实上完全没必要，因为 PCB 数组是定义在全局变量中的，默认就全部填零了，我也没在里面新加指针，所以不需要分配和释放内存，所以没有必要额外初始化，全为 0 就是我想要的初始数据。倒也不能说 xv6 的 hint 是误导人，如果从省内存的角度来看，`struct trapframe alarm_context` 域可以设置成指针，然后在进程分配和销毁的时候分配和释放内存页。但是现在也不缺这点内存，所以直接做成结构体了，免去了分配释放，也很不错啦。况且有初始化的习惯总是好的，只有在确定自己在做什么且不会有问题的时候才可以省去初始化。
+
+做完以上这些，再跑一遍测试，test0-2 都能通过，test3 不通过，报告的错误是寄存器 `a0` 被修改。从系统调用中恢复的时候 `a0` 会被覆盖为系统调用的返回值，因此需要考虑如何正确恢复原来的 `a0` 的值。
+
+事实上中断返回的部分并不会修改原 `a0`，而是完完全全按照 trapframe 中的内容复原回去，是 `syscall()` 中修改了 trapframe 中的 `a0` 值为系统调用的返回值才导致了返回时 `a0` 的变化。因此可以考虑在 `sys_sigreturn()` 返回的时候返回原 trapframe 中 `a0` 的值，这样就相当于没有变化了。最后 `sys_sigreturn()` 修改如下：
+
+```c
+uint64 sys_sigreturn(void){
+  struct proc *p = myproc();
+  p->alarm_in = 0;
+  memmove(p->trapframe, &p->alarm_context, sizeof(struct trapframe));
+  return p->trapframe->a0;
+}
+```
+
+以及 `kernel/trap.c` 中的相关部分代码如下：
+
+```c
+if (which_dev == 2) {
+  if (p->alarm_interval && !p->alarm_in && --p->alarm_remaining <= 0) {
+    memmove(&p->alarm_context, p->trapframe, sizeof(struct trapframe));
+    p->alarm_in = 1;
+    p->trapframe->epc = (uint64)p->alarm_handler;
+    p->alarm_remaining = p->alarm_interval;
+  }
+  yield();
+}
+```
+
+再跑一遍，`alarmtest` 测试和 `usertests -q` 测试都通过。
+
+其实有考虑单独保存 trapframe 的 `epc` 值，并在 `yield()` 切换至新进程之前保存所有当前上下文到 `alarm_context`，`sys_sigreturn()` 的时候直接恢复上下文并恢复 trapframe 的 `epc` 值，就完全复刻了调用 handler 之前的状态，并且又因为 `epc` 值没有被修改，所以不会跳转到 handler，相当于无事发生，很符合预期，可惜没能实现。
