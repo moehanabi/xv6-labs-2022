@@ -95,7 +95,11 @@ sys_uptime(void)
   return xticks;
 }
 
-uint64 sys_sigalarm(void){
+uint64 sys_sigalarm(void) {
+  struct proc *p = myproc();
+  argint(0, &p->alarm_interval);
+  p->alarm_remaining = p->alarm_interval;
+  argaddr(1, &p->alarm_handler);
   return 0;
 }
 
