@@ -503,3 +503,69 @@ main(int argc, char *argv[])
 > - You have to handle the case in which one thread races around the loop before the others have exited the barrier. In particular, you are re-using the `bstate.nthread` variable from one round to the next. Make sure that a thread that leaves the barrier and races around the loop doesn't increase `bstate.nthread` while a previous round is still using it.
 >
 > Test your code with one, two, and more than two threads.
+
+根据提示，这次使用的 pthread 相关函数还有：
+
+```c
+pthread_cond_wait(&cond, &mutex);  // go to sleep on cond, releasing lock mutex, acquiring upon wake up
+pthread_cond_broadcast(&cond);     // wake up every thread sleeping on cond
+```
+
+`struct barrier` 只给了一个锁和一个条件，实际上这里的锁是用来锁住 `bstate` 的，防止一个线程在操作变量的时候另一个线程写入变量，这个变量包括 `bstate.nthread`，不能让两个线程在 `barrier()` 中同时做读后写和读取。
+
+另外不需要因为 `pthread_mutex_unlock()` 会重新获得锁而在 `pthread_cond_broadcast()` 前释放锁以便 `pthread_cond_wait()` 可以立即获取，因为 `pthread_cond_wait()` 在试图获取锁而无法获得的时候还是会被阻塞，直到锁被释放后才会由某个线程再立即获得锁。所以把 `pthread_mutex_unlock()` 放到条件判断分支的外面就可以了。
+
+代码如下：
+
+```c
+static void 
+barrier()
+{
+  // YOUR CODE HERE
+  //
+  // Block until all threads have called barrier() and
+  // then increment bstate.round.
+  //
+  pthread_mutex_lock(&bstate.barrier_mutex);
+  bstate.nthread++;
+  if (bstate.nthread == nthread) {
+    bstate.round++;
+    bstate.nthread=0;
+    pthread_cond_broadcast(&bstate.barrier_cond);
+  } else {
+    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+  }
+  pthread_mutex_unlock(&bstate.barrier_mutex);
+}
+```
+
+先来的线程获取锁，对 `bstate.nthread` 自增，并判断是否所有的线程都已经到达 barrier，若没有，则在 `bstate.barrier_cond` 上等待。最后到的线程判断为真，则重置 `bstate.nthread`，唤起所有线程。所有线程都需要释放锁，最后的线程是因为先前的操作获取了锁而没有释放，先来的是进程是因为 `pthread_cond_wait()` 退出时还会获取锁，因此也要再释放。
+
+根据提示，结束 `barrier()` 时需要对 `bstate.round` 加 1，这个变量是用来测试效果的，也需要在取得锁（释放锁前）的时候处理，至于是在 `pthread_cond_broadcast()` 之前还是之后都无所谓，因为解锁是在 `pthread_mutex_unlock()` 处，只要在这之前都可以。
+
+如果代码是这样写的，`bstate.round` 就没有被保护，当线程数足够多的时候就有很大概率出错，因为先被释放的进程已经进入下一轮循环开始读取 `bstate.round` 了，这边可能还没有做自增操作：
+
+```c
+static void 
+barrier()
+{
+  // YOUR CODE HERE
+  //
+  // Block until all threads have called barrier() and
+  // then increment bstate.round.
+  //
+  pthread_mutex_lock(&bstate.barrier_mutex);
+  bstate.nthread++;
+  if (bstate.nthread == nthread) {
+    bstate.nthread=0;
+    pthread_cond_broadcast(&bstate.barrier_cond);
+    pthread_mutex_unlock(&bstate.barrier_mutex);
+    bstate.round++;
+  } else {
+    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+    pthread_mutex_unlock(&bstate.barrier_mutex);
+  }
+}
+```
+
+最后一个提示是警惕先从 `barrier()` 里出来的线程又开始下一轮循环导致 `bstate.nthread` 被破坏的。我一开始没有想出来什么样的场景才会出现这种情况，难道大家不是统一被放出来的吗？后来写了代码才悟了，每个线程从一轮 barrier 中被释放是统一的，但是有的线程被调度得早，或者跑得快，就跑到下一轮循环了。不过这没有关系，实际上只要前面考虑到位，对 `bstate` 加锁的过程实际上也一并就把这个解决了。
