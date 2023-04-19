@@ -281,6 +281,192 @@ thread_switch:
 > > Modify your code so that some `put` operations run in parallel while maintaining correctness. You're done when `make grade` says your code passes both the `ph_safe` and `ph_fast` tests. The `ph_fast` test requires that two threads yield at least 1.25 times as many puts/second as one thread.
 > >
 
+整个程序的逻辑是先初始化 NKEYS 个数的数组，随后分 n 个线程将自己那一块的数组的值依次与自己的线程号组成 K-V 对加入到哈希表中。完成哈希表写入后再创建 n 个线程用所有的 K 读取哈希表，检测对应的 K-V 对是否存在。现在多线程写入的时候会出问题，一部分的哈希表项创建会失败。
+
+哈希表有 NBUCKET 个 hash bucket，以链表形式存放于 `table[]` 中。`put()` 函数会检测 K 值对应条目是否已存在，若存在则修改已有值为新的值，否则通过 `insert()` 创建新的 K-V 对并插入 `table[i]` 的开头。
+
+问题出在 `put()` 函数与 `insert()` 函数上，线程 A 的 `put()` 函数在检测完之后发现没有条目，因此准备调用 `insert()` 插入，此时线程 B 也想用 `insert()` 插入同 bucket 不同 K 的条目，假如两者都同时执行完了 `e->next = n`，此时两者手上准备好的链分别是：
+
+- 线程 A：A-new -> old-1 -> old-2 -> ...
+- 线程 B：B-new -> old-1 -> old-2 -> ...
+
+两个线程先后执行 `*p = e`，用自己的链替换当前 bucket，先替换的线程 A 的新创建的条目就被丢弃了。其问题就出在线程 B 无法获得线程 A 创建了新条目的信息。
+
+因此就需要有锁来锁住 bucket 的读写。
+
+提示给了几个锁相关的函数与类型，使用方法一眼就能看出来，就不细说了：
+
+```c
+pthread_mutex_t lock;            // declare a lock
+pthread_mutex_init(&lock, NULL); // initialize the lock
+pthread_mutex_lock(&lock);       // acquire lock
+pthread_mutex_unlock(&lock);     // release lock
+```
+
+一种加锁的方式是给整个 `put()` 函数加一把锁，代码如下：
+
+```c
+static 
+void put(int key, int value)
+{
+  int i = key % NBUCKET;
+
+  // is the key already present?
+  pthread_mutex_lock(&lock);
+  struct entry *e = 0;
+  for (e = table[i]; e != 0; e = e->next) {
+    if (e->key == key)
+      break;
+  }
+  if(e){
+    // update the existing key.
+    e->value = value;
+  } else {
+    // the new is new.
+    insert(key, value, &table[i], table[i]);
+  }
+  pthread_mutex_unlock(&lock);
+}
+```
+
+这种方式是可行的，但是会有性能损失，相当于退化成了单线程的顺序执行，而且由于多线程切换与锁的开销，效率会比单线程更低。
+
+另一种加锁方式是对发生竞争的 `insert()` 函数加锁，注意不能加在 `insert()` 函数内，因为进入 `insert()` 函数之后，新链就已经确定了，两线程同时进入函数后依然会出现上述问题，加锁无效。需要在获取当前 bucket 链之前加锁，这样才能使线程 A 新加的节点被线程 B 获得。代码如下：
+
+```c
+static 
+void put(int key, int value)
+{
+  int i = key % NBUCKET;
+
+  // is the key already present?
+  struct entry *e = 0;
+  for (e = table[i]; e != 0; e = e->next) {
+    if (e->key == key)
+      break;
+  }
+  if(e){
+    // update the existing key.
+    e->value = value;
+  } else {
+    // the new is new.
+    pthread_mutex_lock(&lock);
+    insert(key, value, &table[i], table[i]);
+    pthread_mutex_unlock(&lock);
+  }
+
+}
+```
+
+可以过测！看似很美好，效率也比单线程高得多，实际会产生新的问题。回到上面的场景，假设线程 A 与线程 B 同时要加相同 K 值的条目（比如线程 A 要加 `100, 1`，线程 B 要加 `100, 2`），并且同时检查发现条目不存在，都来到了锁前，线程 A 先加，线程 B 等线程 A 加完之后也会再加条目，事实上这和哈希表的设定冲突了。按照代码设计的哈希表本不应该出现相同 K 值的两个条目。这大概是测试代码没有考虑到的问题，可以按照下面修改 `main()` 函数，多跑几次，总能发现有相同 K 的条目。问题事实上也是因为线程 B 获取信息滞后了，线程 B 在插入时能获得线程 A 创建了新条目的信息，但是检测时还无法获得。
+
+```c
+int
+main(int argc, char *argv[])
+{
+  pthread_t *tha;
+  void *value;
+  double t1, t0;
+
+
+  if (argc < 2) {
+    fprintf(stderr, "Usage: %s nthreads\n", argv[0]);
+    exit(-1);
+  }
+  nthread = atoi(argv[1]);
+  tha = malloc(sizeof(pthread_t) * nthread);
+  srandom(0);
+  assert(NKEYS % nthread == 0);
+  for (int i = 0; i < NKEYS; i++) {
+    keys[i] = random()%100;
+  }
+
+  //
+  // first the puts
+  //
+  t0 = now();
+  pthread_mutex_init(&lock, NULL);
+  for(int i = 0; i < nthread; i++) {
+    assert(pthread_create(&tha[i], NULL, put_thread, (void *) (long) i) == 0);
+  }
+  for(int i = 0; i < nthread; i++) {
+    assert(pthread_join(tha[i], &value) == 0);
+  }
+  t1 = now();
+
+  printf("%d puts, %.3f seconds, %.0f puts/second\n",
+         NKEYS, t1 - t0, NKEYS / (t1 - t0));
+
+  struct entry *tmp;
+  for (int i = 0; i < NBUCKET; i++) {
+    for (tmp = table[i]; tmp; tmp = tmp->next) {
+      printf("%d %d %d\n", i, tmp->key,tmp->value);
+    }
+  }
+}
+```
+
+因此一种合理的解法是给每个 bucket 单独一把锁，并从检测到插入全程加锁，避免上述问题。由此可以看出 bucket 数量越多，遇到被上锁的 bucket 的概率越小，性能越高：
+
+```c
+// ......
+
+struct entry *table[NBUCKET];
+int keys[NKEYS];
+int nthread = 1;
+pthread_mutex_t lock[NBUCKET];
+
+// ......
+
+static 
+void put(int key, int value)
+{
+  int i = key % NBUCKET;
+
+  // is the key already present?
+  struct entry *e = 0;
+  pthread_mutex_lock(&lock[i]);
+  for (e = table[i]; e != 0; e = e->next) {
+    if (e->key == key)
+      break;
+  }
+  if(e){
+    // update the existing key.
+    e->value = value;
+  } else {
+    // the new is new.
+    insert(key, value, &table[i], table[i]);
+  }
+  pthread_mutex_unlock(&lock[i]);
+}
+
+// ......
+
+int
+main(int argc, char *argv[])
+{
+  // ......
+
+  //
+  // first the puts
+  //
+  t0 = now();
+  for (int i = 0; i < NBUCKET; i++) {
+    pthread_mutex_init(&lock[i], NULL);
+  }
+  
+  for (int i = 0; i < nthread; i++) {
+    assert(pthread_create(&tha[i], NULL, put_thread, (void *) (long) i) == 0);
+  }
+  for(int i = 0; i < nthread; i++) {
+    assert(pthread_join(tha[i], &value) == 0);
+  }
+  t1 = now();
+
+  // ......
+}
+```
+
 # Barrier([moderate](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
 
 > In this assignment you'll implement a [barrier](http://en.wikipedia.org/wiki/Barrier_(computer_science)): a point in an application at which all participating threads must wait until all other participating threads reach that point too. You'll use pthread condition variables, which are a sequence coordination technique similar to xv6's sleep and wakeup.
