@@ -10,6 +10,8 @@ struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[], userret[];
+extern int mem_count[PHYSTOP >> 12];
+extern struct spinlock mem_count_lock;
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -27,6 +29,53 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+}
+
+static void store_fault_handler() {
+  struct proc *p = myproc();
+  pagetable_t pt = p->pagetable;
+  uint64 stval = r_stval();
+
+  if(stval >= MAXVA) {
+    setkilled(p);
+    return;
+  }
+  
+  pte_t *pte;
+  if ((pte = walk(pt, stval, 0)) == 0)
+    panic("store_fault_handler: pte should exist");
+  if ((*pte & PTE_V) == 0)
+    panic("store_fault_handler: page not present");
+
+  if (!(*pte & PTE_RSW_L)) {
+    setkilled(p);
+    return;
+  }
+
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  acquire(&mem_count_lock);
+  if (mem_count[pa >> 12] == 1) {
+    release(&mem_count_lock);
+    *pte = PA2PTE(pa) | flags | (PTE_W & ~PTE_RSW_L);
+    return;
+  } else {
+    mem_count[pa >> 12] -= 1;
+    release(&mem_count_lock);
+  }
+
+  if ((mem = kalloc()) == 0) {
+    setkilled(p);
+    return;
+  }
+
+  memmove(mem, (char *)pa, PGSIZE);
+  *pte = PA2PTE(mem) | flags | (PTE_W & ~PTE_RSW_L);
 }
 
 //
@@ -67,6 +116,10 @@ usertrap(void)
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
+  } else if(r_scause() == 0xf){
+    store_fault_handler();
+    // printf("usertrap(): store page fault pid=%d\n", p->pid);
+    // printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
