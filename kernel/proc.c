@@ -161,6 +161,11 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  memset(&(p->alarm_context), 0, sizeof(struct trapframe));
+  p->alarm_handler = 0;
+  p->alarm_in = 0;
+  p->alarm_interval = 0;
+  p->alarm_remaining = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;

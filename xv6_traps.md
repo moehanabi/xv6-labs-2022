@@ -330,14 +330,7 @@ if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
 - `int alarm_remaining` 保存距下次 alarm 剩余 ticks 数
 - `uint64 alarm_handler` 保存 alarm 发生时应调用的函数的地址
 
-随后还需要在 `kernel/proc.c` 的 `allocproc()` 中添加相关域的初始化过程：
-
-```c
-// for sigalarm fields
-p->alarm_handler = 0;
-p->alarm_interval = 0;
-p->alarm_remaining = 0;
-```
+记得以上新加的域都需要在 `allocproc()` 中添加相关初始化过程。不过 PCB 都是定义在全局变量中的，也不一定需要初始化，除非是指针需要分配内存空间，但是需要在进程释放的时候（在 `freeproc()` 中）填 0！
 
 随后在 `kernel/trap.c` 的 `usertrap()` 中添加每次时钟中断发生时对 alarm 的相应处理：标记相应的 ticks，判断是否已经到时间，若已经到了则将 handler 插入进程执行流中，并重置剩余 ticks。
 
@@ -396,7 +389,7 @@ uint64 sys_sigreturn(void){
 
 另外要避免 handler 重进入，可以考虑在 PCB 里再加一个 `int alarm_in` 作为 flag，指示当前进程是否是在 alarm handler 中，若是，则不进入 alarm 处理分支（代码略）。
 
-记得以上新加的域都需要在 `allocproc()` 中添加相关初始化过程。。真的吗？事实上完全没必要，因为 PCB 数组是定义在全局变量中的，默认就全部填零了，我也没在里面新加指针，所以不需要分配和释放内存，所以没有必要额外初始化，全为 0 就是我想要的初始数据。倒也不能说 xv6 的 hint 是误导人，如果从省内存的角度来看，`struct trapframe alarm_context` 域可以设置成指针，然后在进程分配和销毁的时候分配和释放内存页。但是现在也不缺这点内存，所以直接做成结构体了，免去了分配释放，也很不错啦。况且有初始化的习惯总是好的，只有在确定自己在做什么且不会有问题的时候才可以省去初始化。
+记得以上新加的域都需要在 `allocproc()` 中添加相关初始化过程。不过 PCB 都是定义在全局变量中的，也不一定需要初始化，除非是指针需要分配内存空间，但是需要在进程释放的时候（在 `freeproc()` 中）填 0！
 
 做完以上这些，再跑一遍测试，test0-2 都能通过，test3 不通过，报告的错误是寄存器 `a0` 被修改。从系统调用中恢复的时候 `a0` 会被覆盖为系统调用的返回值，因此需要考虑如何正确恢复原来的 `a0` 的值。
 
