@@ -439,7 +439,7 @@ static uint64 (*syscalls[])(void) = {
 
 进入 `argraw(n)` 就能发现 n 的取值为 \[0,5\]，也就是说最多能有 5 个参数，参数的值就是中断帧（中断时上下文）中的 `a0 - a5` 的寄存器的值，这正是 RISC-V ABI 中规定的函数参数寄存器，编译出来的代码会将函数的参数依次存入这几个寄存器中。这样我们就知道了如何获取系统调用的参数了。
 
-本想着进入 `kernel/syscall.c` 创建一个全局变量 `uint trace_mask` 来指示当前的 mask 状态，后来想想好像每个进程的 mask 状态都不一样，应该是要在进程的 PCB 中添加更好。在 `syscall()` 中瞟一下，发现有 `struct proc *p` 获取当前进程的相关信息，那就直接在 `kernel/proc.h` 的 `struct proc` 的定义中添加 `uint trace_mask;`。找了一下，所有的 `struct proc` 变量应该都是来源（定义）于 `kernel/proc.c` 的全局变量中，因此不需要考虑额外添加的成员变量的初始化问题。
+本想着进入 `kernel/syscall.c` 创建一个全局变量 `uint trace_mask` 来指示当前的 mask 状态，后来想想好像每个进程的 mask 状态都不一样，应该是要在进程的 PCB 中添加更好。在 `syscall()` 中瞟一下，发现有 `struct proc *p` 获取当前进程的相关信息，那就直接在 `kernel/proc.h` 的 `struct proc` 的定义中添加 `uint trace_mask;`。找了一下，所有的 `struct proc` 变量应该都是来源（定义）于 `kernel/proc.c` 的全局变量中，因此不需要考虑额外添加的成员变量的初始化问题，但是需要考虑进程释放的时候清空数据。
 
 在 `syscall()` 调用 `syscalls[num]()` 后(*You have to modify the xv6 kernel to print out a line when each system call **is about to return***)加上条件判断和符合要求的格式(*The line should contain the process id, the name of the system call and the return value*)的 `printf` 语句即可：
 
