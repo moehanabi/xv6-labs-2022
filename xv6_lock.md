@@ -156,8 +156,120 @@
 >   ```
 >   
 >   You are not required to run the race detector, but you might find it helpful. Note that the race detector slows xv6 down significantly, so you probably don't want to use it when running `usertests`.
->   
->
+
+先测一次 `kalloctest`：
+
+```
+$ kalloctest
+start test1
+test1 results:
+--- lock kmem/bcache stats
+lock: kmem: #test-and-set 210616 #acquire() 433034
+lock: bcache: #test-and-set 0 #acquire() 350
+--- top 5 contended locks:
+lock: proc: #test-and-set 375482 #acquire() 939483
+lock: proc: #test-and-set 222268 #acquire() 539321
+lock: proc: #test-and-set 219402 #acquire() 539323
+lock: kmem: #test-and-set 210616 #acquire() 433034
+lock: proc: #test-and-set 170398 #acquire() 939497
+tot= 210616
+test1 FAIL
+start test2
+total free number of pages: 32497 (out of 32768)
+.....
+test2 OK
+start test3
+usertrap(): unexpected scause 0x000000000000000f pid=6
+            sepc=0x000000000000039e stval=0x0000000000000003
+child done 1
+test3 OK
+```
+
+根据 `acquire()` 函数的定义，每次请求加锁都会让 `struct spinlock->n` 加 1，而每次加锁时（test and set 时）遇到已上锁的情况则会使 `struct spinlock->nts` 加 1。也就是说，`struct spinlock->n` 表示使用 `acquire()` 函数申请自旋锁的次数，`struct spinlock->nts` 表示自旋锁申请（test and set）失败的次数。注意申请失败会重新尝试申请，次数不会累加在 n 中，但是失败后会累加在 nts 中，因此 n 和 nts 并无严格的大小关系。
+
+`kalloctest.c` 中 `ntas()` 会调用 `statistics()` 检查申请加锁次数和加锁失败次数，最终的实现位于 `kernel/spinlock.c` 的 `statslock()` 中，其打印的 tot 指的是 kmem/bcache 的所有锁的 nts 的和，`ntas()` 返回的值就是这个 tot。要想通过 `kalloctest` 的 test1，在开始和结束时 tot 的值相差不能超过 10.
+
+根据上面的测试结果，可以看到在第二次调用 `statistics()` 时有了 433034 次加锁请求，其中尝试申请失败 210616 次。
+
+这个题目比较简单，如果做过前面的实验，应该会对物理内存的管理和分配有较深了解。xv6 的原始设计是整个系统共用一个空闲物理块链表，而无论是释放还是申请物理内存都需要先对这个链表加锁，因此对此的操作是串行的，如果多个 CPU 同时对空闲块链表进行操作很容易造成某个 CPU 等待另一个 CPU 释放整个链表的锁。
+
+根据提示，可以给每个 CPU 都建立一个空闲块链表来实现多个 CPU 之间的并行化。这样每个 CPU 在申请空闲内存空间的时候都只要申请自己的链表的锁即可，释放同理。并且因为申请和释放是两个独立的过程，A CPU 从自己的链表中拿到的物理内存可以由 B CPU 释放加到 B 的链表中，相当于 A CPU 的空闲块转移给了 B CPU。如果某个 CPU 的空闲块链表空了，可以从别的 CPU 的链表里偷一些，只有这种情况下才有可能出现锁的争用。由于这种情况较少发生，所以能大大提高物理内存管理的并行度。如果空闲页不足的时候能偷较多的页，那还可以大幅降低争用的概率。
+
+根据 `main()` 函数，只有 CPU0 会做物理内存管理的初始化 kinit，如果不做修改，`kinit()` 会通过 `freerange()` 调用 `kfree()` 来将所有空闲物理页加入到 CPU0 的链表中。这可能导致其他 CPU 头几次的分配有概率发生锁的竞争，不过随着系统的使用，各个 CPU 的空闲链表也会逐渐平衡。
+
+根据以上分析，代码的修改比较简单，全局的 `kmem` 变量改成 `kmem[NCPU]` 数组，并在用 `kinit()` 初始化的时候给每个 `kmem[i]` 结构体初始化锁。
+
+`kfree()` 释放的时候只需要将所有对 `kmem` 的操作改成 `kmem[cpu]` 即可，而 cpu 则是通过 `cpuid()` 获取。根据提示，使用 `cpuid()` 前后需要使用 `push_off()` 和 `pop_off()` 关闭/开启中断。
+
+`kalloc()` 大体也是相同的修改，需要额外添加的是当前 CPU 下的链表为空时的操作。一种简单的处理方式就是扫描整个 `kmem[]` 数组，直接获取第一个非空链表的第一个页。执行操作的时候需要对读写的链表进行加锁。
+
+这里贴一下 `kalloc()` 的代码：
+
+```c
+void *
+kalloc(void)
+{
+  struct run *r;
+
+  push_off();
+  int cpu = cpuid();
+  pop_off();
+
+  acquire(&kmem[cpu].lock);
+  r = kmem[cpu].freelist;
+  if(r)
+    kmem[cpu].freelist = r->next;
+  release(&kmem[cpu].lock);
+
+  if (!r) {
+    for (int i = 0; i < NCPU; i++) {
+      acquire(&kmem[i].lock);
+      r = kmem[i].freelist;
+      if (r) {
+        kmem[i].freelist = r->next;
+        release(&kmem[i].lock);
+        break;
+      }
+      release(&kmem[i].lock);
+    }
+  }
+
+  if(r)
+    memset((char*)r, 5, PGSIZE); // fill with junk
+  return (void*)r;
+}
+```
+
+其他变更请参考仓库的提交记录。
+
+测试结果：
+
+```
+$ kalloctest
+start test1
+test1 results:
+--- lock kmem/bcache stats
+lock: kmem: #test-and-set 0 #acquire() 42860
+lock: kmem: #test-and-set 0 #acquire() 195504
+lock: kmem: #test-and-set 0 #acquire() 194719
+lock: bcache: #test-and-set 0 #acquire() 1258
+--- top 5 contended locks:
+lock: proc: #test-and-set 242298 #acquire() 408893
+lock: proc: #test-and-set 237178 #acquire() 408856
+lock: proc: #test-and-set 193487 #acquire() 408893
+lock: proc: #test-and-set 176925 #acquire() 408893
+lock: proc: #test-and-set 173102 #acquire() 809049
+tot= 0
+test1 OK
+start test2
+total free number of pages: 32497 (out of 32768)
+.....
+test2 OK
+start test3
+child done 1
+child done 100000
+test3 OK
+```
 
 ## Buffer cache ([hard](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
 
