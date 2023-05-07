@@ -16,6 +16,8 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define MAX_SYMLINK_DEPTH 10
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -335,6 +337,32 @@ sys_open(void)
     }
   }
 
+  if (ip->type == T_SYMLINK) {
+    if (!(omode & O_NOFOLLOW)) {
+      for (int i = 0; i < MAX_SYMLINK_DEPTH; i++) {
+        if (readi(ip, 0, (uint64)path, 0, MAXPATH) != MAXPATH) {
+          iunlockput(ip);
+          end_op();
+          return -1;
+        }
+        iunlockput(ip);
+        ip = namei(path);
+        if (ip == 0) {
+          end_op();
+          return -1;
+        }
+        ilock(ip);
+        if (ip->type != T_SYMLINK)
+          break;
+      }
+      if (ip->type == T_SYMLINK) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+    }
+  }
+
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op();
@@ -504,6 +532,36 @@ sys_pipe(void)
   return 0;
 }
 
-uint64 sys_symlink(void){
+uint64 sys_symlink(void) {
+  char name[DIRSIZ], target[MAXPATH], path[MAXPATH];
+  struct inode *dp, *ip;
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+
+  begin_op();
+
+  if ((dp = nameiparent(path, name)) == 0)
+    return 0;
+
+  ilock(dp);
+  int major = dp->major;
+  int minor = dp->minor;
+  iunlockput(dp);
+
+  ip = create(path, T_SYMLINK, major, minor);
+  if (ip == 0) {
+    end_op();
+    return -1;
+  }
+
+  if (writei(ip, 0, (uint64)target, 0, MAXPATH) < MAXPATH) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  iunlockput(ip);
+  end_op();
   return 0;
 }
