@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fcntl.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -27,6 +31,60 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+}
+
+int map_mmap() {
+  struct proc *p = myproc();
+  uint64 err_addr = r_stval();
+
+  // find relative VMA
+  int vma_i = -1;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].addr <= err_addr &&
+        p->vma[i].addr + p->vma[i].length > err_addr) {
+      vma_i = i;
+      break;
+    }
+  }
+  if (vma_i == -1) // not found
+    return -1;
+
+  // check permission & set prot flag
+  uint64 flag = 0;
+  if (p->vma[vma_i].prot & PROT_READ)
+    flag |= PTE_R;
+  else if (r_scause() == 0xd)
+    return -1;
+  if (p->vma[vma_i].prot & PROT_WRITE)
+    flag |= PTE_W;
+  else if (r_scause() == 0xf)
+    return -1;
+
+  // alloc phy mem
+  void *mem = kalloc();
+  if (!mem) {
+    return -1;
+  }
+  memset(mem, 0, PGSIZE);
+
+  // map new page
+  if (mappages(p->pagetable, PGROUNDDOWN(err_addr), PGSIZE, (uint64)mem,
+               flag | PTE_U) != 0) {
+    kfree(mem);
+    return -1;
+  }
+
+  // load file
+  ilock(p->vma[vma_i].file->ip);
+  if (readi(p->vma[vma_i].file->ip, 1, PGROUNDDOWN(err_addr),
+            PGROUNDDOWN(err_addr) - p->vma[vma_i].addr + p->vma[vma_i].offset,
+            PGSIZE) == -1) {
+    iunlock(p->vma[vma_i].file->ip);
+    return -1;
+  }
+  iunlock(p->vma[vma_i].file->ip);
+
+  return 0;
 }
 
 //
@@ -66,6 +124,8 @@ usertrap(void)
 
     syscall();
   } else if((which_dev = devintr()) != 0){
+    // ok
+  } else if ((r_scause() == 0xd || r_scause() == 0xf) && !map_mmap()) {
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);

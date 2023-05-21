@@ -169,6 +169,9 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  for (int i = 0; i < NVMA; i++) {
+    p->vma[i].used = 0;
+  }
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -308,6 +311,14 @@ fork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  // copy VMAs
+  memmove(np->vma, p->vma, sizeof(p->vma));
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].used) {
+      filedup(p->vma[i].file);
+    }
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -350,6 +361,12 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].used) {
+      munmap(p->vma[i].addr, p->vma[i].length);
+    }
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){

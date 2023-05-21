@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "file.h"
 #include "fcntl.h"
+#include "memlayout.h"
 
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
@@ -505,9 +506,131 @@ sys_pipe(void)
 }
 
 uint64 sys_mmap(void) {
-  return -1;
+  uint64 addr;
+  int length;
+  int prot;
+  int flags;
+  int fd;
+  struct file* file;
+  int offset;
+  uint64 err = 0xffffffffffffffff;
+  struct proc* p=myproc();
+
+  argaddr(0, &addr);
+  argint(1, &length);
+  argint(2, &prot);
+  argint(3, &flags);
+  if (argfd(4, &fd, &file) < 0)
+    return err;
+  argint(5, &offset);
+
+  if (addr != 0 || offset != 0 || length < 0)
+    return err;
+
+  // check permission
+  if (!file->writable && (prot & PROT_WRITE) && (flags & MAP_SHARED))
+    return err;
+  if (!file->readable && (prot & PROT_READ))
+    return err;
+
+  // find free VMA struct
+  int vma_i = -1;
+  for (int i = 0; i < NVMA; i++) {
+    if (!p->vma[i].used) {
+      vma_i = i;
+      break;
+    }
+  }
+  if (vma_i == -1)
+    return err;
+
+  // find lowest existing mmap addr
+  addr = TRAPFRAME;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].used && p->vma[i].addr < addr) {
+      addr = p->vma[i].addr;
+    }
+  }
+  addr = PGROUNDDOWN(addr - length);
+  if (addr < p->sz) // lower than the top of heap
+    return err;
+
+  p->vma[vma_i].used = 1;
+  p->vma[vma_i].addr = addr;
+  p->vma[vma_i].length = length;
+  p->vma[vma_i].file=file;
+  p->vma[vma_i].flags=flags;
+  p->vma[vma_i].prot=prot;
+  p->vma[vma_i].offset=offset;
+
+  // add refcnt of the file
+  filedup(file);
+
+  return addr;
+}
+
+int munmap(uint64 addr, int length) {
+  struct proc *p = myproc();
+
+  // find relative VMA
+  int vma_i = -1;
+  for (int i = 0; i < NVMA; i++) {
+    if (p->vma[i].addr <= addr && p->vma[i].addr + p->vma[i].length > addr) {
+      vma_i = i;
+      break;
+    }
+  }
+  if (vma_i == -1) // not found
+    return -1;
+
+  // unmap virtual page
+  pte_t *pte;
+  if (addr == p->vma[vma_i].addr + p->vma[vma_i].offset) {
+    p->vma[vma_i].addr += length;
+    p->vma[vma_i].offset += length;
+    p->vma[vma_i].length -= length;
+    // write back
+    if (p->vma[vma_i].flags == MAP_SHARED) {
+      filewrite(p->vma[vma_i].file, addr, length);
+    }
+    for (uint64 va = addr; va < addr + length; va += PGSIZE) {
+      if ((pte = walk(p->pagetable, va, 0)) == 0)
+        panic("uvmunmap: walk");
+      if ((*pte & PTE_V) == 0)
+        continue;
+      uvmunmap(p->pagetable, va, 1, 1);
+    }
+  } else if (addr + length == p->vma[vma_i].addr + p->vma[vma_i].length) {
+    p->vma[vma_i].length -= length;
+    // write back
+    if (p->vma[vma_i].flags == MAP_SHARED) {
+      filewrite(p->vma[vma_i].file, addr, length);
+    }
+    for (uint64 va = addr; va < addr + length; va += PGSIZE) {
+      if ((pte = walk(p->pagetable, va, 0)) == 0)
+        panic("uvmunmap: walk");
+      if ((*pte & PTE_V) == 0)
+        continue;
+      uvmunmap(p->pagetable, va, 1, 1);
+    }
+  } else {
+    return -1;
+  }
+
+  // release file & VMA
+  if (p->vma[vma_i].length <= 0) {
+    fileclose(p->vma[vma_i].file);
+    p->vma[vma_i].used = 0;
+  }
+
+  return 0;
 }
 
 uint64 sys_munmap(void) {
-  return -1;
+  uint64 addr;
+  int length;
+  argaddr(0, &addr);
+  argint(1, &length);
+
+  return munmap(addr, length);
 }
