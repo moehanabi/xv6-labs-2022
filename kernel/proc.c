@@ -169,9 +169,6 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
-  for (int i = 0; i < NVMA; i++) {
-    p->vma[i].used = 0;
-  }
 }
 
 // Create a user page table for a given process, with no user memory,

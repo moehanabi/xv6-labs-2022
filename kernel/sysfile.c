@@ -586,35 +586,30 @@ int munmap(uint64 addr, int length) {
   // unmap virtual page
   pte_t *pte;
   if (addr == p->vma[vma_i].addr + p->vma[vma_i].offset) {
+    // munmap from beginning
     p->vma[vma_i].addr += length;
     p->vma[vma_i].offset += length;
-    p->vma[vma_i].length -= length;
-    // write back
-    if (p->vma[vma_i].flags == MAP_SHARED) {
-      filewrite(p->vma[vma_i].file, addr, length);
-    }
-    for (uint64 va = addr; va < addr + length; va += PGSIZE) {
-      if ((pte = walk(p->pagetable, va, 0)) == 0)
-        panic("uvmunmap: walk");
-      if ((*pte & PTE_V) == 0)
-        continue;
-      uvmunmap(p->pagetable, va, 1, 1);
-    }
   } else if (addr + length == p->vma[vma_i].addr + p->vma[vma_i].length) {
-    p->vma[vma_i].length -= length;
-    // write back
-    if (p->vma[vma_i].flags == MAP_SHARED) {
-      filewrite(p->vma[vma_i].file, addr, length);
-    }
-    for (uint64 va = addr; va < addr + length; va += PGSIZE) {
-      if ((pte = walk(p->pagetable, va, 0)) == 0)
-        panic("uvmunmap: walk");
-      if ((*pte & PTE_V) == 0)
-        continue;
-      uvmunmap(p->pagetable, va, 1, 1);
-    }
+    // munmap from end
+    // jump out of if
   } else {
     return -1;
+  }
+
+  p->vma[vma_i].length -= length;
+
+  // write back
+  if (p->vma[vma_i].flags == MAP_SHARED) {
+    filewrite(p->vma[vma_i].file, addr, length);
+  }
+
+  // unmap pagetable
+  for (uint64 va = addr; va < addr + length; va += PGSIZE) {
+    if ((pte = walk(p->pagetable, va, 0)) == 0)
+      panic("uvmunmap: walk");
+    if ((*pte & PTE_V) == 0)
+      continue;
+    uvmunmap(p->pagetable, va, 1, 1);
   }
 
   // release file & VMA
