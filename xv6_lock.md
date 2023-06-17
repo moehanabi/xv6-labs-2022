@@ -1,4 +1,4 @@
-## Memory allocator ([moderate](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
+# Memory allocator ([moderate](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
 
 > The program user/kalloctest stresses xv6's memory allocator: three processes grow and shrink their address spaces, resulting in many calls to `kalloc` and `kfree`. `kalloc` and `kfree` obtain `kmem.lock`. kalloctest prints (as "#test-and-set") the number of loop iterations in `acquire` due to attempts to acquire a lock that another core already holds, for the `kmem` lock and a few other locks. The number of loop iterations in `acquire` is a rough measure of lock contention. The output of `kalloctest` looks similar to this before you start the lab:
 >
@@ -271,7 +271,7 @@ child done 100000
 test3 OK
 ```
 
-## Buffer cache ([hard](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
+# Buffer cache ([hard](https://pdos.csail.mit.edu/6.828/2022/labs/guidance.html))
 
 > This half of the assignment is independent from the first half; you can work on this half (and pass the tests) whether or not you have completed the first half.
 >
@@ -362,3 +362,86 @@ test3 OK
 > - Some debugging tips: implement bucket locks but leave the global bcache.lock acquire/release at the beginning/end of bget to serialize the code. Once you are sure it is correct without race conditions, remove the global locks and deal with concurrency issues. You can also run `make CPUS=1 qemu` to test with one core.
 > - Use xv6's race detector to find potential races (see above how to use the race detector).
 
+这个任务我实现地比较简单，直接将原有的 `bcache` 结构体做成一个数组，也就是把原来放置在一个数组中的所有缓冲区分成若干个桶，每次使用时可以从不同的桶中选择，降低出现竞争的概率。根据提示的推荐，数组大小设为 13，每个结构体中的 `buf[]` 缓冲区数量为原数量除以13。其余的链表、锁都没有修改。
+
+随后设定一个哈希函数，计算块号对应的哈希值，一种简单的方法就是块号对 13 取余。
+
+`binit()` 初始化时需要修改的就是对所有桶都做初始化。`brelse()`, `bpin()` 与 `bunpin()` 的修改也就是先对需要处理的磁盘块号取哈希值，找到对应的桶，并从中查找并处理相应的块缓冲。
+
+`bget()` 时需要处理的与 `brelse()` 类似，也是先取块号的哈希值，并在对应的桶中搜索。如果搜索不到时，则在对应的桶中通过链表获取空页缓冲区。然而这里还会出现当前桶中无空闲缓冲区，而其他桶中仍有空闲缓冲区的情况，这个时候如果直接返回缓冲区满不合适，可以和 Memory allocator 一样从别的桶中偷一些缓冲区来加到当前桶的链表中。实际上因为对缓冲区的操作基本都是通过链表完成的，所以甚至不需要修改相关桶中的 `struct buf buf[]` 缓冲区数组，它们的作用仅仅是在没有 malloc 的情况下用来获得内存空间用的，管理的时候并不经过这个数组。
+
+编写代码的时候记得加锁与释放锁，尤其是释放锁需要注意避免加了锁不释放，也要避免重复释放。
+
+`bget()` 的完整代码如下：
+
+```c
+// Look through buffer cache for block on device dev.
+// If not found, allocate a buffer.
+// In either case, return locked buffer.
+static struct buf*
+bget(uint dev, uint blockno)
+{
+  struct buf *b;
+
+  int bucket_no=hash(blockno);
+
+  acquire(&bcache[bucket_no].lock);
+
+  // Is the block already cached?
+  for(b = bcache[bucket_no].head.next; b != &bcache[bucket_no].head; b = b->next){
+    if(b->dev == dev && b->blockno == blockno){
+      b->refcnt++;
+      release(&bcache[bucket_no].lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+
+  // Not cached.
+  // Recycle the least recently used (LRU) unused buffer.
+  // Search bcache[bucket_no] first
+  for(b = bcache[bucket_no].head.prev; b != &bcache[bucket_no].head; b = b->prev){
+    if(b->refcnt == 0) {
+      b->dev = dev;
+      b->blockno = blockno;
+      b->valid = 0;
+      b->refcnt = 1;
+      release(&bcache[bucket_no].lock);
+      acquiresleep(&b->lock);
+      return b;
+    }
+  }
+
+  // Search other bucket then
+  release(&bcache[bucket_no].lock);
+  for (int i = 0; i < BCACHE_NUM; i++) {
+    acquire(&bcache[i].lock);
+    for (b = bcache[i].head.prev; b != &bcache[i].head; b = b->prev) {
+      if (b->refcnt == 0) {
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+
+        // delete buf from bcache[i]
+        b->prev->next=b->next;
+        b->next->prev=b->prev;
+        release(&bcache[i].lock);
+
+        // insert buf to bcache[bucket_no]
+        acquire(&bcache[bucket_no].lock);
+        b->next = bcache[bucket_no].head.next;
+        b->prev = &bcache[bucket_no].head;
+        bcache[bucket_no].head.next->prev = b;
+        bcache[bucket_no].head.next = b;
+        release(&bcache[bucket_no].lock);
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
+    release(&bcache[i].lock);
+  }
+
+  panic("bget: no buffers");
+}
+```
